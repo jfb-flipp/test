@@ -1,0 +1,646 @@
+# user and group to run as
+#user nobody;
+
+# number of nginx workers
+worker_processes 4;
+worker_rlimit_nofile 500000;
+
+pid /var/run/nginx.pid;
+
+# Number of worker connections. 1024 is a good default
+events {
+  worker_connections  8192;
+  use epoll; # linux only!
+  accept_mutex on; # "on" if nginx worker_processes > 1
+}
+
+# start the http module where we config http access.
+http {
+  # don't display nginx version in Server header/error pages
+  server_tokens off;
+
+  # pull in mime-types. You can break out your config
+  # into as many include's as you want to make it cleaner
+  #include /etc/nginx/mime.types;
+
+  # set a default type for the rare situation that
+  # nothing matches from the mimie-type include
+  default_type  application/octet-stream;
+
+  # no sendfile on OSX
+  sendfile on;
+
+  # These are good default values.
+  tcp_nopush        on;
+  tcp_nodelay       on;
+
+  # output compression saves bandwidth
+  gzip              on;
+  gzip_http_version 1.1;
+  gzip_comp_level   2;
+  gzip_proxied      any;
+  gzip_types        text/plain text/css application/x-javascript text/xml application/xml application/xml+rss text/javascript application/json;
+
+  # SSL Certificates
+  ssl_certificate     /etc/nginx/certs/wishabi.com.crt;
+  ssl_certificate_key /etc/nginx/certs/wishabi.com.key;
+
+  # SSL Config
+  ssl_dhparam /etc/ssl/certs/dhparam.pem;
+  ssl_ciphers <%= scope.lookupvar('nginx_v2::ssl_ciphers') %>
+  ssl_prefer_server_ciphers <%= scope.lookupvar('nginx_v2::ssl_prefer_server_ciphers') %>
+  ssl_protocols <%= scope.lookupvar('nginx_v2::ssl_protocols') %>
+  ssl_session_cache <%= scope.lookupvar('nginx_v2::ssl_session_cache') %>
+  ssl_session_timeout <%= scope.lookupvar('nginx_v2::ssl_session_timeout') %>
+
+  # configure log format
+  log_format main '$remote_addr - $host - $http_x_forwarded_for - $remote_user [$time_local] '
+                  '"$request" $status $body_bytes_sent "$sent_http_location" "$http_referer" '
+                  '"$http_user_agent"';
+
+  # log files
+  log_format tagman '$remote_addr $http_x_forwarded_for [$time_iso8601] '
+                       '$uid_set $uid_got '
+                       '"$request" $status $body_bytes_sent "$http_referer" '
+                       '"$http_user_agent"';
+
+  # main access log
+  access_log  /var/log/nginx/access.log main;
+  error_log   /var/log/nginx/error.log notice;
+
+  real_ip_header X-Forwarded-For;
+  set_real_ip_from 10.0.0.0/8;
+
+  server {
+    listen 80;
+    server_name _;
+    return 444;
+  }
+
+  server {
+    listen 127.0.0.1:80;
+    server_name localhost;
+
+    location = /nginx_stub_status {
+      stub_status on;
+      allow 127.0.0.1;
+      deny all;
+    }
+  }
+
+  server {
+    listen 80;
+
+    server_name b.wishabi.com 10.*;
+
+    # P3P required for IE to accept IFrame cookies
+    add_header P3P 'CP="ALL ADM DEV PSAi COM OUR OTRo STP IND ONL"';
+
+    # server root
+    root /usr/local/openresty/nginx/html;
+
+    # Block bots and other invalid user agents
+    if ($http_user_agent ~* (BingPreview) ) {
+      return 403;
+    }
+
+    # Enable sessions
+    userid         on;
+    userid_name    xgid;
+    userid_domain  b.wishabi.com;
+    userid_path    /;
+    userid_expires 2y;
+
+    # Health check pings redis
+    location /ping {
+      default_type 'text/plain';
+      access_log off;
+      access_by_lua '
+        local redis = require "resty.redis"
+        local red = redis:new()
+
+        local ok, err = red:connect("unix:/var/run/redis/redis.sock")
+
+        if not ok then
+          ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR)
+        end
+
+        local resp = red:ping()
+
+        red:close()
+
+        if resp == "PONG" then
+          ngx.exit(ngx.HTTP_OK)
+        else
+          ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR)
+        end
+      ';
+    }
+
+    location /track.gif {
+      add_header Access-Control-Allow-Origin *;
+      access_log  /mnt/nginx_logs/b.access.log tagman;
+      error_log   /mnt/nginx_logs/b.error.log;
+      allow all;
+      expires -1;
+
+      access_by_lua '
+
+        local args = ngx.req.get_uri_args()
+
+        local flyer_run_id = args.flyer_run_id
+        if not flyer_run_id then
+          ngx.log(ngx.DEBUG, "missing flyer_run_id")
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local aid = args.aid
+        local flipp_premium_merchant = args.flipp_premium_merchant
+        local channel = 0
+
+        local gma = args.gma
+        if gma == "true" then
+          ngx.log(ngx.DEBUG, "ignoring gma beacons")
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local CHANNELS = {["hosted"] = 1, ["native"] = 2, ["flipp"] = 3}
+        if aid == "flipp" and flipp_premium_merchant == "1" then
+          channel = CHANNELS["flipp"]
+        elseif aid == "flyers" then
+          local channel_id = tonumber(args.channel_id)
+          if not channel_id then
+            ngx.log(ngx.DEBUG, "missing channel_id")
+            return ngx.exit(ngx.HTTP_OK)
+          end
+          local premium_merchant = args.premium_merchant
+          if channel_id > 0 and premium_merchant == "true" then
+            channel = CHANNELS["native"]
+          elseif channel_id == 0 then
+            channel = CHANNELS["hosted"]
+          else
+            ngx.log(ngx.DEBUG, "invalid channel_id")
+            return ngx.exit(ngx.HTTP_OK)
+          end
+        elseif aid == "editorials" then
+          channel = ""
+        else
+          ngx.log(ngx.DEBUG, "unsupported aid: ", aid)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local EVENT_TYPES = {["ev"] = 1, ["open"] = 2, ["module_impression"] = 3, ["module_viewed"] = 4}
+        local event_type
+        if aid == "editorials" then
+          local et = args.et
+          if not et then
+            ngx.log(ngx.DEBUG, "missing et")
+            return ngx.exit(ngx.HTTP_OK)
+          end
+          if et == "view" then
+            event_type = EVENT_TYPES["module_impression"]
+          elseif et == "viewed" then
+            event_type = EVENT_TYPES["module_viewed"]
+          end
+        else
+          event_type = EVENT_TYPES[args.t]
+        end
+        if not event_type then
+          ngx.log(ngx.DEBUG, "unsupported event_type: ", event_type)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local key = string.format("%s:%s:%s:http", flyer_run_id, event_type, channel)
+
+        local redis = require "resty.redis"
+        local red = redis:new()
+
+        red:set_timeout(1000) -- 1 second
+
+        local ok, err = red:connect("unix:/var/run/redis/redis.sock")
+        if not ok then
+          ngx.log(ngx.DEBUG, "failed to connect to redis: ", err)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local redirect_url, err = red:get(key)
+        if not redirect_url then
+          ngx.log(ngx.DEBUG, "failed to get redis key: ", err)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        if redirect_url == ngx.null then
+          ngx.log(ngx.DEBUG, "no tracking url found for key: ", key)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local resty_string = require "resty.string"
+        local resty_random = require "resty.random"
+
+        if string.match(redirect_url, "%[%[randomn%]%]") then
+          local randomn = resty_string.to_hex(resty_random.bytes(16))
+          redirect_url = string.gsub(redirect_url, "%[%[randomn%]%]", randomn)
+        end
+
+        if string.match(redirect_url, "%[%[xgid%]%]") then
+          local xgid = ""
+          if ngx.var.uid_got then
+            xgid = string.gsub(ngx.var.uid_got, "xgid=", "")
+          elseif ngx.var.uid_set then
+            xgid = string.gsub(ngx.var.uid_set, "xgid=", "")
+          end
+          redirect_url = string.gsub(redirect_url, "%[%[xgid%]%]", xgid)
+        end
+
+        return ngx.redirect(redirect_url, ngx.HTTP_MOVED_TEMPORARILY)
+      ';
+    }
+
+    location /robots.txt {
+      allow all;
+      access_log off;
+    }
+
+    location / {
+      deny all;
+      access_log off;
+      return 444;
+    }
+  }
+
+  server {
+    listen 443;
+    server_name b.wishabi.com;
+
+    # P3P required for IE to accept IFrame cookies
+    add_header P3P 'CP="ALL ADM DEV PSAi COM OUR OTRo STP IND ONL"';
+
+    ssl_certificate     /etc/nginx/certs/wishabi.com.crt;
+    ssl_certificate_key /etc/nginx/certs/wishabi.com.key;
+    ssl on;
+
+    # Block bots and other invalid user agents
+    if ($http_user_agent ~* (BingPreview) ) {
+      return 403;
+    }
+
+    # server root
+    root /usr/local/openresty/nginx/html;
+
+    # Enable sessions
+    userid         on;
+    userid_name    xgid;
+    userid_domain  b.wishabi.com;
+    userid_path    /;
+    userid_expires 2y;
+ 
+    # Health check pings redis
+    location /ping {
+      default_type 'text/plain';
+      access_log off;
+      access_by_lua '
+        local redis = require "resty.redis"
+        local red = redis:new()
+
+        local ok, err = red:connect("unix:/var/run/redis/redis.sock")
+
+        if not ok then
+          ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR)
+        end
+
+        local resp = red:ping()
+
+        red:close()
+
+        if resp == "PONG" then
+          ngx.exit(ngx.HTTP_OK)
+        else
+          ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR)
+        end
+      ';
+    }
+
+    location /track_tag_js.html {
+       default_type 'text/html';
+       allow all;
+       access_log off;
+       expires -1;
+ 
+       access_by_lua '
+         local CHANNELS = {
+           ["hosted"] = 1, ["native"] = 2, ["flipp"] = 3, ["gma"] = 4
+         }
+ 
+         local EVENT_TYPES = {
+           ["ev"] = 1, ["open"] = 2, ["module_impression"] = 3
+         }
+ 
+         local args = ngx.req.get_uri_args()
+ 
+         local aid         = args.aid
+         local channel_id  = tonumber(args.channel_id) or tonumber(args.channel)
+         local t           = args.t
+         local entity_type = args.entity_type
+         local entity_id   = args.entity_id
+ 
+         -- param existence
+         if not (aid and channel_id and t and entity_type and entity_id) then
+           ngx.log(ngx.DEBUG, "param missing")
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         -- param handling
+         if not (aid == "flyers") then
+           ngx.log(ngx.DEBUG, "aid is not flyers")
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         local channel
+         if entity_type == "gma_campaign" then
+           channel = CHANNELS["gma"]
+         else 
+           if channel_id < 1 then
+             ngx.log(ngx.DEBUG, "hosted is not supported")
+             return ngx.exit(ngx.HTTP_OK)
+           end
+           channel = CHANNELS["native"]
+         end
+ 
+         local event_type = EVENT_TYPES[args.t]
+ 
+         if not event_type then
+           ngx.log(ngx.DEBUG, "t is not supported")
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         -- redis query
+         local key = string.format(
+                       "%s:%s:%s:%s:%s",
+                       "html",
+                       entity_type,
+                       entity_id,
+                       event_type,
+                       channel
+                     )
+         local redis = require "resty.redis"
+         local red = redis:new()
+ 
+         red:set_timeout(1000) -- 1 second
+ 
+         local ok, err = red:connect("unix:/var/run/redis/redis.sock")
+
+         if not ok then
+           ngx.log(ngx.DEBUG, "failed to connect to redis: ", err)
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         local tag_code, err = red:get(key)
+ 
+         if not tag_code then
+           ngx.log(ngx.DEBUG, "failed to get redis key: ", err)
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         if tag_code == ngx.null then
+           ngx.log(ngx.DEBUG, "no tag code found for key: ", key)
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         -- response
+         ngx.header["Content-type"] = "text/html"
+         ngx.say(
+           "<html><body><script>try {delete window.document.referrer;" ..
+           " Object.defineProperty(document, \'referrer\', {get : " ..
+           "function(){ return \'\'; }});} catch (err) {}</script>" ..
+           tag_code ..
+           "</body></html>"
+         )
+         return ngx.exit(ngx.HTTP_OK)
+       ';
+     }
+
+    location /track.gif {
+      add_header Access-Control-Allow-Origin *;
+      access_log  /mnt/nginx_logs/b.access.log tagman;
+      error_log   /mnt/nginx_logs/b.error.log;
+      allow all;
+      expires -1;
+
+      access_by_lua '
+
+        local args = ngx.req.get_uri_args()
+
+        local flyer_run_id = args.flyer_run_id
+        if not flyer_run_id then
+          ngx.log(ngx.DEBUG, "missing flyer_run_id")
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local aid = args.aid
+        local flipp_premium_merchant = args.flipp_premium_merchant
+        local channel = 0
+
+        local gma = args.gma
+        if gma == "true" then
+          ngx.log(ngx.DEBUG, "ignoring gma beacons")
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local CHANNELS = {["hosted"] = 1, ["native"] = 2, ["flipp"] = 3}
+        if aid == "flipp" and flipp_premium_merchant == "1" then
+          channel = CHANNELS["flipp"]
+        elseif aid == "flyers" then
+          local channel_id = tonumber(args.channel_id)
+          if not channel_id then
+            ngx.log(ngx.DEBUG, "missing channel_id")
+            return ngx.exit(ngx.HTTP_OK)
+          end
+          local premium_merchant = args.premium_merchant
+          if channel_id > 0 and premium_merchant == "true" then
+            channel = CHANNELS["native"]
+          elseif channel_id == 0 then
+            channel = CHANNELS["hosted"]
+          else
+            ngx.log(ngx.DEBUG, "invalid channel_id")
+            return ngx.exit(ngx.HTTP_OK)
+          end
+        elseif aid == "editorials" then
+          channel = ""
+        else
+          ngx.log(ngx.DEBUG, "unsupported aid: ", aid)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local EVENT_TYPES = {["ev"] = 1, ["open"] = 2, ["module_impression"] = 3, ["module_viewed"] = 4}
+        local event_type
+        if aid == "editorials" then
+          local et = args.et
+          if not et then
+            ngx.log(ngx.DEBUG, "missing et")
+            return ngx.exit(ngx.HTTP_OK)
+          end
+          if et == "view" then
+            event_type = EVENT_TYPES["module_impression"]
+          elseif et == "viewed" then
+            event_type = EVENT_TYPES["module_viewed"]
+          end
+        else
+          event_type = EVENT_TYPES[args.t]
+        end
+        if not event_type then
+          ngx.log(ngx.DEBUG, "unsupported event_type: ", event_type)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local key = string.format("%s:%s:%s:https", flyer_run_id, event_type, channel)
+
+        local redis = require "resty.redis"
+        local red = redis:new()
+
+        red:set_timeout(1000) -- 1 second
+
+        local ok, err = red:connect("unix:/var/run/redis/redis.sock")
+        if not ok then
+          ngx.log(ngx.DEBUG, "failed to connect to redis: ", err)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local redirect_url, err = red:get(key)
+        if not redirect_url then
+          ngx.log(ngx.DEBUG, "failed to get redis key: ", err)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        if redirect_url == ngx.null then
+          ngx.log(ngx.DEBUG, "no tracking url found for key: ", key)
+          return ngx.exit(ngx.HTTP_OK)
+        end
+
+        local resty_string = require "resty.string"
+        local resty_random = require "resty.random"
+
+        if string.match(redirect_url, "%[%[randomn%]%]") then
+          local randomn = resty_string.to_hex(resty_random.bytes(16))
+          redirect_url = string.gsub(redirect_url, "%[%[randomn%]%]", randomn)
+        end
+
+        if string.match(redirect_url, "%[%[xgid%]%]") then
+          local xgid = ""
+          if ngx.var.uid_got then
+            xgid = string.gsub(ngx.var.uid_got, "xgid=", "")
+          elseif ngx.var.uid_set then
+            xgid = string.gsub(ngx.var.uid_set, "xgid=", "")
+          end
+          redirect_url = string.gsub(redirect_url, "%[%[xgid%]%]", xgid)
+        end
+
+        return ngx.redirect(redirect_url, ngx.HTTP_MOVED_TEMPORARILY)
+      '; 
+    }
+
+    location /track_tag.js {
+       default_type 'application/json';
+       access_log  /mnt/nginx_logs/b.access.log tagman;
+       error_log   /mnt/nginx_logs/b.error.log;
+       allow all;
+       expires -1;
+       xss_get on;
+       xss_callback_arg c;
+       xss_output_type 'application/json';
+ 
+       access_by_lua '
+         local CHANNELS = {
+           ["hosted"] = 1, ["native"] = 2, ["flipp"] = 3, ["gma"] = 4
+         }
+ 
+         local EVENT_TYPES = {
+           ["ev"] = 1, ["open"] = 2, ["module_impression"] = 3, ["module_viewed"] = 4
+         }
+ 
+         local args = ngx.req.get_uri_args()
+ 
+         local aid         = args.aid
+         local channel_id  = tonumber(args.channel_id) or tonumber(args.channel)
+         local t           = args.t
+         local entity_type = args.entity_type
+         local entity_id   = args.entity_id
+ 
+         -- param existence
+         if not (aid and channel_id and t and entity_type and entity_id) then
+           ngx.log(ngx.DEBUG, "param missing")
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         -- param handling
+         if not (aid == "flyers") then
+           ngx.log(ngx.DEBUG, "aid is not flyers")
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         local channel
+         if entity_type == "gma_campaign" then
+           channel = CHANNELS["gma"]
+         else
+           if channel_id < 1 then
+             ngx.log(ngx.DEBUG, "hosted is not supported")
+             return ngx.exit(ngx.HTTP_OK)
+           end
+           channel = CHANNELS["native"]
+         end
+ 
+         local event_type = EVENT_TYPES[args.t]
+ 
+         if not event_type then
+           ngx.log(ngx.DEBUG, "t is not supported")
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         -- redis query
+         local key = string.format(
+                       "%s:%s:%s:%s",
+                       entity_type,
+                       entity_id,
+                       event_type,
+                       channel
+                     )
+         local redis = require "resty.redis"
+         local red = redis:new()
+ 
+         red:set_timeout(1000) -- 1 second
+ 
+         local ok, err = red:connect("unix:/var/run/redis/redis.sock")
+         if not ok then
+           ngx.log(ngx.DEBUG, "failed to connect to redis: ", err)
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         local tag_code, err = red:get(key)
+ 
+         if not tag_code then
+           ngx.log(ngx.DEBUG, "failed to get redis key: ", err)
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         if tag_code == ngx.null then
+           ngx.log(ngx.DEBUG, "no tag code found for key: ", key)
+           return ngx.exit(ngx.HTTP_OK)
+         end
+ 
+         -- response
+         ngx.say("{\'tag\':\'" .. tag_code .. "\'}")
+         return ngx.exit(ngx.HTTP_OK)
+       ';
+     }
+ 
+    location /robots.txt {
+      allow all;
+    }
+
+    location / {
+      deny all;
+      access_log off;
+      return 444;
+    }
+  }
+
+}
